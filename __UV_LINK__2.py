@@ -75,6 +75,52 @@ def import_from_fbx(fbx_path, doc):
             main_obj.SetName(original_name + "_UV")
     return new_objects
 
+def start_rizomuv_server():
+    """Uruchom RizomUV w trybie serwera"""
+    rizom_path = find_rizomuv_path()
+    if not rizom_path:
+        raise RuntimeError("Nie znaleziono RizomUV!")
+    
+    print(f"Uruchamiam RizomUV serwer: {rizom_path}")
+    
+    # Spróbuj różne kombinacje parametrów
+    server_commands = [
+        [rizom_path, "--server", "--port", "8080"],
+        [rizom_path, "--server", "8080"],
+        [rizom_path, "-server", "-port", "8080"],
+        [rizom_path, "-server", "8080"],
+        [rizom_path, "--port", "8080"],
+        [rizom_path, "-port", "8080"],
+        [rizom_path, "--server"],  # Bez portu - może używa domyślnego
+        [rizom_path, "-server"]
+    ]
+    
+    process = None
+    for cmd in server_commands:
+        try:
+            print(f"Próbuję: {' '.join(cmd)}")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(3)  # Dłuższe czekanie
+            
+            # Sprawdź czy proces nadal działa
+            if process.poll() is None:
+                print(f"Serwer uruchomiony: {' '.join(cmd)}")
+                break
+            else:
+                # Sprawdź błędy
+                stdout, stderr = process.communicate()
+                print(f"Proces zakończony. STDOUT: {stdout.decode()}")
+                print(f"STDERR: {stderr.decode()}")
+                process = None
+        except Exception as e:
+            print(f"Błąd z komendą {' '.join(cmd)}: {e}")
+            process = None
+    
+    if not process:
+        raise RuntimeError("Nie udało się uruchomić RizomUV z żadną kombinacją parametrów!")
+    
+    return process
+
 def auto_uv_with_library(fbx_path, output_path):
     """Automatyczne UV używając biblioteki RizomUV Link"""
     if not RIZOM_LINK_AVAILABLE:
@@ -83,33 +129,84 @@ def auto_uv_with_library(fbx_path, output_path):
     print("Łączę z RizomUV...")
     link = CRizomUVLinkBase()
     
-    # Sprawdź czy RizomUV działa na porcie 8080
+    # Proste sprawdzenie portu 8080
     if not link.TCPPortIsOpen(8080):
-        raise RuntimeError("RizomUV nie działa na porcie 8080! Uruchom RizomUV w trybie serwera.")
+        print("RizomUV nie działa. Uruchamiam...")
+        rizom_process = start_rizomuv_server()
+        time.sleep(5)
     
+    # Połącz
     link.Connect(8080)
     
     print("Wczytuję model BEZ UV...")
-    # KLUCZ: File.XYZ = True ignoruje wszystkie UV!
     result = link.Load({
         "File": {
             "Path": fbx_path,
-            "XYZ": True  # IGNORUJE UV, używa tylko 3D danych
+            "XYZ": True  # IGNORUJE UV
         }
     })
     
     if result != "IMPORT_TASK_SUCCES":
         raise RuntimeError(f"Błąd wczytywania: {result}")
     
-    print("Model wczytany bez UV. Robię automatyczne UV...")
-    
-    # Automatyczne operacje UV
-    link.Select({
-        "PrimType": "Edge",
-        "Select": True,
-        "Auto": {"Skeleton": True}
-    })
+    print("Robię automatyczne UV...")
+    link.Select({"PrimType": "Edge", "Select": True, "Auto": {"Skeleton": True}})
     link.Cut({"UseSelection": True})
+    link.Unfold({"WorkingSet": "Visible"})
+    link.Pack({"Translate": True})
+    
+    result = link.Save({"File": {"Path": output_path}})
+    if result != "EXPORT_TASK_SUCCES":
+        raise RuntimeError(f"Błąd eksportu: {result}")
+    
+    print("Automatyczne UV zakończone!")
+    return True
+
+def convert_edge_selection_to_seams(fbx_path, output_path, edge_ids=None):
+    """Konwertuj edge selection na seams używając biblioteki RizomUV Link"""
+    if not RIZOM_LINK_AVAILABLE:
+        raise RuntimeError("Biblioteka RizomUV Link niedostępna!")
+    
+    print("Łączę z RizomUV...")
+    link = CRizomUVLinkBase()
+    
+    if not link.TCPPortIsOpen(8080):
+        print("RizomUV nie działa na porcie 8080. Uruchamiam serwer...")
+        rizom_process = start_rizomuv_server()
+        
+        # Sprawdź ponownie
+        if not link.TCPPortIsOpen(8080):
+            raise RuntimeError("Nie udało się uruchomić RizomUV serwer!")
+    
+    link.Connect(8080)
+    
+    print("Wczytuję model...")
+    result = link.Load({
+        "File": {
+            "Path": fbx_path,
+            "XYZ": True  # Ignoruj UV
+        }
+    })
+    
+    if result != "IMPORT_TASK_SUCCES":
+        raise RuntimeError(f"Błąd wczytywania: {result}")
+    
+    print("Konwertuję edge selection na seams...")
+    
+    if edge_ids:
+        # Użyj konkretnych ID krawędzi
+        link.Cut({
+            "PrimType": "Edge",
+            "IDs": edge_ids
+        })
+    else:
+        # Użyj aktualnej selekcji (jeśli jest)
+        link.Cut({
+            "PrimType": "Edge",
+            "UseSelection": True
+        })
+    
+    print("Seams utworzone. Rozwijam UV...")
     link.Unfold({"WorkingSet": "Visible"})
     link.Pack({"Translate": True})
     
@@ -118,8 +215,41 @@ def auto_uv_with_library(fbx_path, output_path):
     if result != "EXPORT_TASK_SUCCES":
         raise RuntimeError(f"Błąd eksportu: {result}")
     
-    print("Automatyczne UV zakończone!")
+    print("Konwersja edge selection na seams zakończona!")
     return True
+
+def get_selected_edge_ids(obj):
+    """Pobierz ID wybranych krawędzi z obiektu Cinema 4D"""
+    if not obj or obj.GetType() != c4d.Opolygon:
+        return None
+    
+    # Sprawdź czy obiekt ma tag Polygon Selection
+    tags = obj.GetTags()
+    edge_selection = None
+    
+    for tag in tags:
+        if tag.GetType() == c4d.Tpolygonselection:
+            # To jest selekcja poligonów, ale możemy użyć krawędzi
+            edge_selection = tag
+            break
+    
+    if not edge_selection:
+        print("Nie znaleziono selekcji krawędzi")
+        return None
+    
+    # Pobierz selekcję
+    selection = edge_selection.GetBaseSelect()
+    if not selection:
+        return None
+    
+    # Konwertuj na listę ID
+    edge_ids = []
+    for i in range(obj.GetPolygonCount() * 4):  # Każdy poligon ma 4 krawędzie
+        if selection.IsSelected(i):
+            edge_ids.append(i)
+    
+    print(f"Znaleziono {len(edge_ids)} wybranych krawędzi")
+    return edge_ids
 
 def main():
     doc = c4d.documents.GetActiveDocument()
@@ -131,12 +261,8 @@ def main():
         c4d.gui.MessageDialog("Wybrany obiekt nie jest poligonem")
         return
     
-    # Pytaj użytkownika o tryb
-    if RIZOM_LINK_AVAILABLE:
-        result = c4d.gui.MessageDialog("Wybierz tryb UV:\n\nOK - Automatyczne UV (biblioteka)\nAnuluj - Ręczne UV", c4d.GEMB_OKCANCEL)
-        mode = "auto" if result == c4d.GEMB_OK else "manual"
-    else:
-        mode = "manual"
+    # Automatyczny tryb domyślnie
+    mode = "auto" if RIZOM_LINK_AVAILABLE else "manual"
     
     try:
         export_dir = os.path.join(os.path.expanduser("~"), "temp_rizomuv")
@@ -147,8 +273,17 @@ def main():
         export_to_fbx(obj, fbx_path)
         
         if mode == "auto" and RIZOM_LINK_AVAILABLE:
-            # Automatyczne UV z biblioteką
-            auto_uv_with_library(fbx_path, output_path)
+            # Sprawdź czy użytkownik chce konwersję edge selection
+            result = c4d.gui.MessageDialog("Wybierz tryb:\n\nOK - Edge Selection → Seams\nAnuluj - Automatyczne UV", c4d.GEMB_OKCANCEL)
+            
+            if result == c4d.GEMB_OK:
+                # Konwersja edge selection na seams
+                edge_ids = get_selected_edge_ids(obj)
+                convert_edge_selection_to_seams(fbx_path, output_path, edge_ids)
+            else:
+                # Automatyczne UV
+                auto_uv_with_library(fbx_path, output_path)
+            
             new_objects = import_from_fbx(output_path, doc)
         else:
             # Ręczne UV
